@@ -7,10 +7,16 @@ import numpy as np
 import tensorflow as tf
 import tensorflow_datasets as tfds
 from flask import Flask, request, jsonify
+import tensorflow_model_optimization as tfmot
+from tensorflow_model_optimization.python.core.keras.compat import keras
+#from tensorflow.keras.models import clone_model
+
+import tempfile
 import threading
 import logging # Import logging
 import socket # Import socket for port checking
-
+import tempfile
+import time
 # --- Configuração Inicial e Supressão de Logs ---
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 tf.get_logger().setLevel('ERROR')
@@ -26,6 +32,7 @@ app.logger.setLevel(logging.INFO) # Default level for application logs
 
 # You can set a more verbose level for specific debug scenarios:
 # app.logger.setLevel(logging.DEBUG)
+A =0
 
 # --- Estado Global da Simulação FL ---
 FL_STATE = {
@@ -67,6 +74,8 @@ def get_default_args():
     parser.add_argument('--client_optimizer', type=str, default='sgd', choices=['sgd', 'adam'])
     parser.add_argument('--client_lr', type=float, default=0.01)
     parser.add_argument('--aggregation_method', type=str, default='fedavg', choices=['fedavg'])
+    parser.add_argument('--quanti', type=str, default='y', choices=['y','n'])
+    parser.add_argument('--prune', type=str, default='y', choices=['y','n'])
 
     # Outros
     parser.add_argument('--eval_every', type=int, default=1)
@@ -387,10 +396,67 @@ def load_and_distribute_data_api():
     app.logger.info(f"Eligible clients (with >0 samples): {len(FL_STATE['eligible_client_indices'])} out of {config.num_clients}.")
 
     return True # Success
-
+def structurally_prune_model(original_model, dataset_name, conv_prune_ratio=0.3, dense_prune_ratio=0.5):
+    """Prunes entire filters from Conv2D layers and units from Dense layers"""
+    
+    # Clone the model to preserve original
+    model = tf.keras.models.clone_model(original_model)
+    model.set_weights(original_model.get_weights())
+    
+    # Get layer-wise pruning ratios
+    prune_ratios = {
+        'conv2d': conv_prune_ratio,
+        'dense': dense_prune_ratio
+    }
+    
+    # Special handling for CIFAR10's second conv block
+    if dataset_name == 'cifar10':
+        prune_ratios['conv2d_1'] = conv_prune_ratio
+    
+    # Create new model with pruned architecture
+    new_layers = []
+    for i, layer in enumerate(model.layers):
+        if isinstance(layer, tf.keras.layers.Conv2D):
+            # Calculate remaining filters
+            layer_name = layer.name.lower()
+            ratio = prune_ratios.get(layer_name, prune_ratios['conv2d'])
+            remaining_filters = int(layer.filters * (1 - ratio))
+            
+            # Add pruned conv layer
+            new_layer = tf.keras.layers.Conv2D(
+                remaining_filters,
+                kernel_size=layer.kernel_size,
+                strides=layer.strides,
+                padding=layer.padding,
+                activation=layer.activation,
+                kernel_initializer=tf.keras.initializers.GlorotUniform()
+            )
+            new_layers.append(new_layer)
+            
+        elif isinstance(layer, tf.keras.layers.Dense) and i != len(model.layers)-1:
+            # Don't prune output layer
+            remaining_units = int(layer.units * (1 - prune_ratios['dense']))
+            
+            new_layer = tf.keras.layers.Dense(
+                remaining_units,
+                activation=layer.activation,
+                kernel_initializer=tf.keras.initializers.GlorotUniform()
+            )
+            new_layers.append(new_layer)
+            
+        else:
+            # Copy non-prunable layers (MaxPool, Flatten, Output)
+            new_layers.append(layer.__class__.from_config(layer.get_config()))
+    
+    # Build new model
+    pruned_model = tf.keras.Sequential(new_layers)
+    pruned_model.build(input_shape=original_model.input_shape)
+    
+    return pruned_model
 # --- 3. Treinamento e Agregação Federada (adaptado para usar FL_STATE['config']) ---
 def client_update_api(model_template, global_weights, client_tf_dataset, num_unique_samples_this_client):
     config = FL_STATE['config']
+    
     if num_unique_samples_this_client == 0:
         app.logger.warning("  Client update skipped: 0 unique samples for this client.")
         return global_weights, 0.0, 0.0
@@ -416,11 +482,59 @@ def client_update_api(model_template, global_weights, client_tf_dataset, num_uni
 
     app.logger.debug(f"  Client training for {config.local_epochs} local epochs, steps_per_epoch: {steps_per_epoch_val}.")
     history = client_model.fit(client_tf_dataset, epochs=1, verbose=0, steps_per_epoch=steps_per_epoch_val)
-
+    
     loss = history.history['loss'][-1] if 'loss' in history.history and history.history['loss'] else 0.0
     accuracy = history.history['sparse_categorical_accuracy'][-1] if 'sparse_categorical_accuracy' in history.history and history.history['sparse_categorical_accuracy'] else 0.0
     app.logger.debug(f"  Client training finished. Loss: {loss:.4f}, Accuracy: {accuracy:.4f}.")
-    return client_model.get_weights(), loss, accuracy
+    
+    if config.quanti == 'y' and config.prune == 'n':
+        
+        client_copy = tf.keras.models.clone_model(client_model)
+        client_copy.set_weights(client_model.get_weights())
+        quant_converter = tf.lite.TFLiteConverter.from_keras_model(client_copy)
+        quant_converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        quant_tflite_model = quant_converter.convert()
+        size_in_bytes = len(quant_tflite_model)
+        size_in_mb = size_in_bytes / (1024 ** 2)  # Convertendo para MB
+        
+    if config.quanti == 'n' and config.prune == 'n':
+        num_params = client_model.count_params()  # Número de parâmetros
+        size_in_bytes = num_params * 4  # Cada parâmetro é um float32 (4 bytes)
+        size_in_mb = size_in_bytes / (1024 ** 2)
+    
+    if config.quanti == 'n' and config.prune == 'y':
+        client_copy = tf.keras.models.clone_model(client_model)
+        client_copy.set_weights(client_model.get_weights())
+        pruned_model = structurally_prune_model(
+        client_copy, 
+        dataset_name='mnist',
+        conv_prune_ratio=0.4,  # Remove 40% of conv filters
+        dense_prune_ratio=0.5  # Remove 50% of dense units
+        )
+        num_params = pruned_model.count_params()  # Número de parâmetros
+        size_in_bytes = num_params * 4  # Cada parâmetro é um float32 (4 bytes)
+        size_in_mb = size_in_bytes / (1024 ** 2)
+        
+    if config.quanti == 'y' and config.prune == 'y':
+        client_copy = tf.keras.models.clone_model(client_model)
+        client_copy.set_weights(client_model.get_weights())
+        
+        pruned_model = structurally_prune_model(
+        client_copy, 
+        dataset_name='mnist',
+        conv_prune_ratio=0.4,  # Remove 40% of conv filters
+        dense_prune_ratio=0.5  # Remove 50% of dense units
+        )
+                     
+        hentai = tf.keras.models.clone_model(pruned_model)
+        hentai.set_weights(pruned_model.get_weights())
+        quant_converter = tf.lite.TFLiteConverter.from_keras_model(hentai)
+        quant_converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        quant_tflite_model = quant_converter.convert()
+        size_in_bytes = len(quant_tflite_model)
+        size_in_mb = size_in_bytes / (1024 ** 2)  # Convertendo para MB
+        
+    return client_model.get_weights(), loss, accuracy, size_in_mb
 
 def aggregate_weights_fedavg_api(client_weights_list, client_num_samples_list):
     if not client_weights_list:
@@ -633,6 +747,7 @@ def run_training_round():
         current_round_client_losses = []
         current_round_client_accuracies = []
         current_round_client_performance = {} # Detailed per-client performance
+        current_round_client_size = []
 
         for client_original_idx in sampled_original_client_indices:
             client_ds_for_training = FL_STATE['client_train_datasets'][client_original_idx]
@@ -643,21 +758,23 @@ def run_training_round():
                 continue
 
             app.logger.info(f"    Training client {client_original_idx} with {num_unique_samples} samples...")
-            updated_w, loss, acc = client_update_api(
+            updated_w, loss, acc, size  = client_update_api(
                 FL_STATE['global_model'],
                 FL_STATE['current_global_weights'],
                 client_ds_for_training,
-                num_unique_samples
+                num_unique_samples,
+                
             )
             current_round_client_updates.append(updated_w)
             current_round_client_sample_counts.append(num_unique_samples)
             current_round_client_losses.append(loss)
             current_round_client_accuracies.append(acc)
+            #current_round_client_size.append(model_size)
             current_round_client_performance[client_original_idx] = {"loss": float(loss), "accuracy": float(acc), "num_samples": num_unique_samples}
-
+            
             # --- Simulate Training Time and Model Size ---
             # Model size is usually constant for a given architecture
-            simulated_model_size_bytes = 2 * 1024 * 1024 # 2MB example constant size
+            simulated_model_size_bytes = size * 1024 * 1024 # 2MB example constant size
             # Training time scales with number of samples and local epochs
             simulated_training_time_ms = max(100, int(100 + num_unique_samples * 0.5 * config.local_epochs)) # Example: 100ms base + 0.5ms/sample/epoch
             current_round_client_performance[client_original_idx]['simulated_model_size_bytes'] = simulated_model_size_bytes
