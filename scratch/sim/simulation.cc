@@ -61,10 +61,10 @@ using json = nlohmann::json;
 NS_LOG_COMPONENT_DEFINE("Simulation");
 
 // Global constants
-static constexpr double simStopTime = 400.0;
+static constexpr double simStopTime = 151.0;
 static constexpr int numberOfUes = 10; // Reduced for faster testing
 static constexpr int numberOfEnbs = 5; // Reduced for faster testing
-static constexpr int numberOfParticipatingClients = 15;
+static constexpr int numberOfParticipatingClients = 5;
 static constexpr int scenarioSize = 1000;
 bool useStaticClients = true;
 std::string algorithm = "fedavg"; // This will map to FL API's aggregation if
@@ -825,8 +825,8 @@ int main(int argc, char *argv[]) {
   LogComponentEnable("ClientTypes", LOG_LEVEL_INFO);
   LogComponentEnable("DataFrame", LOG_LEVEL_DEBUG); // DataFrame can be chatty
   LogComponentEnable("Notifications",LOG_LEVEL_INFO); // Keep connection logs visible
-  LogComponentEnable("TcpSocket", LOG_LEVEL_DEBUG); // Increased logging for Sockets
-  LogComponentEnable("TcpSocketBase", LOG_LEVEL_DEBUG); // Even more
+  //LogComponentEnable("TcpSocket", LOG_LEVEL_DEBUG); // Increased logging for Sockets
+  //LogComponentEnable("TcpSocketBase", LOG_LEVEL_DEBUG); // Even more
   // socket detail LogComponentEnable("Ipv4L3Protocol", LOG_LEVEL_DEBUG); //
   // Logging for network layer issues Uncomment for very detailed debug logs:
   // LogComponentEnable("Simulation", LOG_LEVEL_DEBUG);
