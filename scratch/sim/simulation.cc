@@ -61,10 +61,10 @@ using json = nlohmann::json;
 NS_LOG_COMPONENT_DEFINE("Simulation");
 
 // Global constants
-static constexpr double simStopTime = 151.0;
-static constexpr int numberOfUes = 10; // Reduced for faster testing
+static constexpr double simStopTime = 600.0;
+static constexpr int numberOfUes = 15; // Reduced for faster testing
 static constexpr int numberOfEnbs = 5; // Reduced for faster testing
-static constexpr int numberOfParticipatingClients = 5;
+static constexpr int numberOfParticipatingClients = 15;
 static constexpr int scenarioSize = 1000;
 bool useStaticClients = true;
 std::string algorithm = "fedavg"; // This will map to FL API's aggregation if

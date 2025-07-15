@@ -10,7 +10,7 @@ from flask import Flask, request, jsonify
 import tensorflow_model_optimization as tfmot
 from tensorflow_model_optimization.python.core.keras.compat import keras
 #from tensorflow.keras.models import clone_model
-
+import json
 import tempfile
 import threading
 import logging # Import logging
@@ -59,7 +59,7 @@ def get_default_args():
     parser.add_argument('--dataset', type=str, default='mnist',
                         choices=['mnist', 'emnist_digits', 'emnist_char', 'cifar10'])
     parser.add_argument('--num_clients', type=int, default=10)
-    parser.add_argument('--non_iid_type', type=str, default='iid', choices=['iid', 'pathological', 'dirichlet'])
+    parser.add_argument('--non_iid_type', type=str, default='dirichlet', choices=['iid', 'pathological', 'dirichlet'])
     parser.add_argument('--non_iid_alpha', type=float, default=0.5) # Para Pathological: num_classes_per_client
     parser.add_argument('--quantity_skew_type', type=str, default='uniform', choices=['uniform', 'power_law'])
     parser.add_argument('--power_law_beta', type=float, default=2.0)
@@ -259,42 +259,25 @@ def load_and_distribute_data_api():
         client_target_samples_per_class = np.zeros((config.num_clients, num_classes), dtype=int)
 
         # Distribute total samples based on Dirichlet proportions
-        # This approach ensures all samples are used if total_train_samples_tfds is the base.
         total_samples_assigned_to_clients_so_far = 0
+        total_train_samples_tfds = len(y_global_orig)  # Total de amostras disponíveis
+
+        # A lista de índices distribuídos para os clientes
+        client_data_indices_map = {}
+
         for client_idx in range(config.num_clients):
-            # total_samples_for_this_client = int(label_proportions[client_idx].sum() * total_train_samples_tfds / config.num_clients)
-            # This is tricky: sum of proportions for a client is 1. We need to normalize proportions by column.
-            # A common way for Dirichlet:
-            # 1. Calculate how many samples of *each class* go to *each client*
-            # 2. Sum for each client.
-
-            # This loop iterates through clients, and for each client, calculates how many samples it gets from *each* class.
-            # This is slightly different from some other Dirichlet implementations where you iterate class by class.
-            # The original code's logic of `target_num_samples_from_class_for_client` implies this.
-
-            # Total samples available for distribution for each label
             available_samples_per_label = [len(indices) for indices in indices_by_label]
-
             client_indices_list = []
             for label_k in range(num_classes):
-                if available_samples_per_label[label_k] == 0: continue
+                if available_samples_per_label[label_k] == 0:
+                    continue
 
-                # Normalize the client's proportion for this class across all clients.
-                # Sum of label_proportions[client_idx, label_k] for a fixed client_idx over all label_k is 1.0.
-                # Sum of label_proportions[client_idx, label_k] for a fixed label_k over all client_idx is not 1.0.
-                # We need to scale label_proportions[client_idx, label_k] by the *total amount of data* in that class,
-                # then ensure the sum over clients for that class doesn't exceed total_samples_in_that_class.
-
-                # Let's try the simple and common way:
-                # Assign fraction of total samples based on client's Dirichlet vector
-                num_samples_for_this_client_overall = total_train_samples_tfds / config.num_clients # Base for each client
-
-                # Take samples for this client from each class based on its proportion
+                # Calcula a quantidade de amostras que o cliente deve receber dessa classe
+                num_samples_for_this_client_overall = total_train_samples_tfds / config.num_clients
                 num_to_take_from_label_k = int(label_proportions[client_idx, label_k] * num_samples_for_this_client_overall)
 
                 start_ptr = ptr_by_label[label_k]
                 num_available_for_label_k = len(indices_by_label[label_k]) - start_ptr
-
                 num_actually_taken = min(num_to_take_from_label_k, num_available_for_label_k)
 
                 if num_actually_taken > 0:
@@ -307,7 +290,32 @@ def load_and_distribute_data_api():
             total_samples_assigned_to_clients_so_far += len(client_indices_list)
             app.logger.debug(f"  Client {client_idx}: assigned {len(client_data_indices_map[client_idx])} samples.")
 
+        # Ajuste final para garantir que todos os dados sejam distribuídos
+        total_assigned = sum(len(indices) for indices in client_data_indices_map.values())
+        if total_assigned != total_train_samples_tfds:
+            app.logger.info(f"Distribuição final: ajustando para garantir que todas as amostras sejam atribuídas.")
+            missing_samples = total_train_samples_tfds - total_assigned
+            app.logger.debug(f"Faltam {missing_samples} amostras para distribuir.")
+            
+            # Redistribuir os dados que faltam
+            if missing_samples > 0:
+                # Encontrar clientes que receberam menos dados que o total
+                client_idxs_with_fewer_samples = [client_idx for client_idx, indices in client_data_indices_map.items() if len(indices) < (total_train_samples_tfds / config.num_clients)]
+                for client_idx in client_idxs_with_fewer_samples:
+                    remaining_samples = total_train_samples_tfds // config.num_clients - len(client_data_indices_map[client_idx])
+                    for label_k in range(num_classes):
+                        if remaining_samples > 0:
+                            start_ptr = ptr_by_label[label_k]
+                            available_for_label_k = len(indices_by_label[label_k]) - start_ptr
+                            num_to_take = min(remaining_samples, available_for_label_k)
+                            client_data_indices_map[client_idx].extend(indices_by_label[label_k][start_ptr:start_ptr + num_to_take])
+                            ptr_by_label[label_k] = start_ptr + num_to_take
+                            remaining_samples -= num_to_take
+
+                np.random.shuffle(client_data_indices_map[client_idx])  # Garantir a aleatoriedade final
+
         app.logger.info(f"Total samples distributed via Dirichlet: {total_samples_assigned_to_clients_so_far} out of {total_train_samples_tfds}.")
+
 
     else:
         app.logger.error(f"Tipo de não-IID desconhecido: {config.non_iid_type}")
@@ -481,6 +489,7 @@ def client_update_api(model_template, global_weights, client_tf_dataset, num_uni
          steps_per_epoch_val = int(np.ceil(num_unique_samples_this_client * config.local_epochs / config.batch_size))
 
     app.logger.debug(f"  Client training for {config.local_epochs} local epochs, steps_per_epoch: {steps_per_epoch_val}.")
+    
     history = client_model.fit(client_tf_dataset, epochs=1, verbose=0, steps_per_epoch=steps_per_epoch_val)
     
     loss = history.history['loss'][-1] if 'loss' in history.history and history.history['loss'] else 0.0
@@ -526,9 +535,9 @@ def client_update_api(model_template, global_weights, client_tf_dataset, num_uni
         dense_prune_ratio=0.5  # Remove 50% of dense units
         )
                      
-        hentai = tf.keras.models.clone_model(pruned_model)
-        hentai.set_weights(pruned_model.get_weights())
-        quant_converter = tf.lite.TFLiteConverter.from_keras_model(hentai)
+        pruquant = tf.keras.models.clone_model(pruned_model)
+        pruquant.set_weights(pruned_model.get_weights())
+        quant_converter = tf.lite.TFLiteConverter.from_keras_model(pruquant)
         quant_converter.optimizations = [tf.lite.Optimize.DEFAULT]
         quant_tflite_model = quant_converter.convert()
         size_in_bytes = len(quant_tflite_model)
@@ -741,6 +750,16 @@ def run_training_round():
 
 
         app.logger.info(f"  Round {round_num}/{getattr(config, 'num_rounds_api_max', 'N/A')} - Sampled clients (original indices): {sampled_original_client_indices}")
+        try:
+            client_selection_record = {
+                "round": round_num,
+                "clients": sampled_original_client_indices
+            }
+            with open("selected_clients.jsonl", "a") as log_file:
+                log_file.write(json.dumps(client_selection_record) + "\n")
+            app.logger.info(f"  Rodada {round_num}: clientes selecionados salvos em selected_clients.jsonl")
+        except Exception as log_error:
+            app.logger.warning(f"  Não foi possível salvar os clientes da rodada {round_num}: {log_error}")
 
         current_round_client_updates = []
         current_round_client_sample_counts = []
@@ -792,7 +811,7 @@ def run_training_round():
             new_global_weights = aggregate_weights_fedavg_api(current_round_client_updates, current_round_client_sample_counts)
             if new_global_weights is not None:
                 FL_STATE['current_global_weights'] = new_global_weights
-                FL_STATE['global_model'].set_weights(FL_STATE['current_global_weights'])
+                FL_STATE['global_model'].set_weights(new_global_weights)
                 app.logger.info(f"    Global model updated with FedAvg aggregation.")
             else:
                 app.logger.warning("    FedAvg aggregation resulted in None weights. Global model not updated.")

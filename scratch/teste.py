@@ -36,6 +36,7 @@ def create_model_api(dataset_name, num_classes_override=None, seed=None, config=
     model.add(tf.keras.layers.Dense(num_classes, activation='softmax', kernel_initializer=tf.keras.initializers.GlorotUniform(seed=seed)))
     #app.logger.info(f"Model created for dataset '{dataset_name}' with input shape {input_shape} and {num_classes} classes.")
     return model
+
 def evaluate_model(interpreter, test_images, test_labels):
     input_index = interpreter.get_input_details()[0]["index"]
     output_index = interpreter.get_output_details()[0]["index"]
@@ -250,7 +251,8 @@ if __name__ == "__main__":
               metrics=['accuracy'])
     train_images_subset = train_images[0:1000] # out of 60000
     train_labels_subset = train_labels[0:1000]
-
+    print(type(quantize_model))
+    print(type(q_aware_model))
     #q_aware_model.fit(train_images_subset, train_labels_subset,
                   #batch_size=500, epochs=1, validation_split=0.1)
     
