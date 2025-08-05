@@ -717,36 +717,17 @@ def run_training_round():
         selected_client_indices_input = data.get('client_indices', None)
 
         sampled_original_client_indices = []
-        if selected_client_indices_input is not None:
-            if not isinstance(selected_client_indices_input, list) or not all(isinstance(i, int) for i in selected_client_indices_input):
-                FL_STATE['is_training_round_active'] = False
-                app.logger.error(f"Invalid client_indices format: {selected_client_indices_input}")
-                return jsonify({"error": "client_indices deve ser uma lista de inteiros."}), 400
+        num_clients_to_sample = min(config.clients_per_round, len(FL_STATE['eligible_client_indices']))
 
-            # Valida se os índices fornecidos são elegíveis
-            sampled_original_client_indices = [
-                idx for idx in selected_client_indices_input if idx in FL_STATE['eligible_client_indices']
-            ]
-            if len(sampled_original_client_indices) != len(selected_client_indices_input):
-                app.logger.warning(f"Some manually selected clients ({len(selected_client_indices_input) - len(sampled_original_client_indices)}) are not eligible or do not exist. Using only valid ones: {sampled_original_client_indices}.")
-            if not sampled_original_client_indices:
-                FL_STATE['is_training_round_active'] = False
-                app.logger.warning("No valid clients from manually selected indices for training.")
-                return jsonify({"message": "Nenhum dos clientes selecionados manualmente é elegível ou possui dados. Rodada pulada."}), 200
-            app.logger.info(f"  Clients selected by ns-3 (original indices): {sampled_original_client_indices}")
-        else:
-            num_clients_to_sample = min(config.clients_per_round, len(FL_STATE['eligible_client_indices']))
-            if num_clients_to_sample > 0:
-                sampled_original_client_indices = np.random.choice(
-                    FL_STATE['eligible_client_indices'],
-                    size=num_clients_to_sample,
-                    replace=False
-                ).tolist()
-                app.logger.info(f"  Clients sampled by API (original indices): {sampled_original_client_indices}")
-            else:
-                 FL_STATE['is_training_round_active'] = False
-                 app.logger.info("  No clients to sample for this round.")
-                 return jsonify({"message": "Nenhum cliente para amostrar nesta rodada (verifique clients_per_round e dados dos clientes)."}), 200
+        # Seleção direta dos clientes
+        sampled_original_client_indices = np.random.choice(
+        FL_STATE['eligible_client_indices'],
+        size=num_clients_to_sample,
+        replace=False
+        ).tolist()
+
+        app.logger.info(f"Clients selected for this round: {sampled_original_client_indices}")
+
 
 
         app.logger.info(f"  Round {round_num}/{getattr(config, 'num_rounds_api_max', 'N/A')} - Sampled clients (original indices): {sampled_original_client_indices}")

@@ -61,12 +61,12 @@ using json = nlohmann::json;
 NS_LOG_COMPONENT_DEFINE("Simulation");
 
 // Global constants
-static constexpr double simStopTime = 600.0;
-static constexpr int numberOfUes = 15; // Reduced for faster testing
-static constexpr int numberOfEnbs = 5; // Reduced for faster testing
-static constexpr int numberOfParticipatingClients = 15;
+static constexpr double simStopTime = 200.0;
+static constexpr int numberOfUes = 100; // Reduced for faster testing
+static constexpr int numberOfEnbs = 10; // Reduced for faster testing
+static constexpr int numberOfParticipatingClients = 20;
 static constexpr int scenarioSize = 1000;
-bool useStaticClients = true;
+bool useStaticClients = false;
 std::string algorithm = "fedavg"; // This will map to FL API's aggregation if
                                   // needed, but /run_round uses its own.
 
@@ -995,65 +995,83 @@ int main(int argc, char *argv[]) {
   NS_LOG_INFO("Created " << numberOfEnbs << " eNBs and " << numberOfUes
                          << " UEs.");
 
-  MobilityHelper enbmobility;
-  // Use RandomRectanglePositionAllocator for random eNB distribution
-  Ptr<RandomRectanglePositionAllocator> enbPositionAlloc =
-      CreateObject<RandomRectanglePositionAllocator>();
-  // Set bounds to the scenario size
-  std::string enbBounds = "0|" + std::to_string(scenarioSize) + "|0|" +
-                          std::to_string(scenarioSize);
-  enbPositionAlloc->SetAttribute(
-      "X", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=" +
-                       std::to_string(scenarioSize) + "]"));
-  enbPositionAlloc->SetAttribute(
-      "Y", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=" +
-                       std::to_string(scenarioSize) + "]"));
-  // Z is 0 by default for 2D allocators, explicitly set if needed, but usually
-  // not for typical ground scenarios
+  double txRadius = 200.0; // Transmission radius for UEs
 
-  enbmobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-  enbmobility.SetPositionAllocator(enbPositionAlloc);
-  enbmobility.Install(enbNodes);
-  NS_LOG_INFO("eNBs installed with ConstantPositionMobilityModel and random "
-              "positions within scenario size.");
+// --- eNB MOBILITY SETUP (Uniform Grid) ---
+MobilityHelper enbmobility;
+Ptr<ListPositionAllocator> enbPositionAlloc = CreateObject<ListPositionAllocator>();
 
-  // --- UE MOBILITY SETUP (Conditional) ---
-  MobilityHelper uemobility;
-  if (useStaticClients) {
-    NS_LOG_INFO("Installing ConstantPositionMobilityModel for static UEs with "
-                "random positions.");
+uint32_t numEnbs = enbNodes.GetN();
+uint32_t gridSize = std::ceil(std::sqrt(numEnbs));
+double spacing = scenarioSize / gridSize;
+
+// Place eNBs uniformly in a grid
+for (uint32_t i = 0; i < gridSize; ++i) {
+    for (uint32_t j = 0; j < gridSize && (i * gridSize + j) < numEnbs; ++j) {
+        enbPositionAlloc->Add(Vector(i * spacing + spacing / 2,
+                                     j * spacing + spacing / 2,
+                                     0.0));
+    }
+}
+
+enbmobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+enbmobility.SetPositionAllocator(enbPositionAlloc);
+enbmobility.Install(enbNodes);
+NS_LOG_INFO("eNBs installed in a uniform grid using ConstantPositionMobilityModel.");
+
+// --- UE MOBILITY SETUP (Random inside txRadius of an eNB) ---
+MobilityHelper uemobility;
+Ptr<ListPositionAllocator> uePositionAlloc = CreateObject<ListPositionAllocator>();
+
+Ptr<UniformRandomVariable> randAngle = CreateObject<UniformRandomVariable>();
+randAngle->SetAttribute("Min", DoubleValue(0.0));
+randAngle->SetAttribute("Max", DoubleValue(2 * M_PI));
+
+Ptr<UniformRandomVariable> randRadius = CreateObject<UniformRandomVariable>();
+randRadius->SetAttribute("Min", DoubleValue(0.0));
+randRadius->SetAttribute("Max", DoubleValue(txRadius));
+
+Ptr<UniformRandomVariable> randEnb = CreateObject<UniformRandomVariable>();
+randEnb->SetAttribute("Min", DoubleValue(0.0));
+randEnb->SetAttribute("Max", DoubleValue(enbNodes.GetN() - 1));
+
+for (uint32_t u = 0; u < ueNodes.GetN(); ++u) {
+    bool validPos = false;
+    Vector pos;
+    while (!validPos) {
+        uint32_t enbIndex = (uint32_t)randEnb->GetValue();
+        Vector enbPos = enbNodes.Get(enbIndex)->GetObject<MobilityModel>()->GetPosition();
+
+        double angle = randAngle->GetValue();
+        double r = randRadius->GetValue();
+        double x = enbPos.x + r * std::cos(angle);
+        double y = enbPos.y + r * std::sin(angle);
+
+        if (x >= 0 && x <= scenarioSize && y >= 0 && y <= scenarioSize) {
+            pos = Vector(x, y, 0.0);
+            validPos = true;
+        }
+    }
+    uePositionAlloc->Add(pos);
+}
+
+uemobility.SetPositionAllocator(uePositionAlloc);
+
+if (useStaticClients) {
+    NS_LOG_INFO("Installing ConstantPositionMobilityModel for static UEs within eNB radius.");
     uemobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-    // Use RandomRectanglePositionAllocator for static UE distribution
-    Ptr<RandomRectanglePositionAllocator> uePositionAlloc =
-        CreateObject<RandomRectanglePositionAllocator>();
-    // Set bounds to the scenario size
-    std::string ueBounds = "0|" + std::to_string(scenarioSize) + "|0|" +
-                           std::to_string(scenarioSize);
-    uePositionAlloc->SetAttribute(
-        "X", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=" +
-                         std::to_string(scenarioSize) + "]"));
-    uePositionAlloc->SetAttribute(
-        "Y", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=" +
-                         std::to_string(scenarioSize) + "]"));
-
-    uemobility.SetPositionAllocator(uePositionAlloc);
     uemobility.Install(ueNodes);
-    NS_LOG_INFO("Static UEs installed with ConstantPositionMobilityModel and "
-                "random positions within scenario size.");
-  } else {
-    NS_LOG_INFO("Installing RandomWalk2dMobilityModel for mobile UEs.");
-    // Keep Random Walk for UEs, update bounds to use scenarioSize
-    std::string walkBounds = "0|" + std::to_string(scenarioSize) + "|0|" +
-                             std::to_string(scenarioSize);
+} else {
+    NS_LOG_INFO("Installing RandomWalk2dMobilityModel for mobile UEs within scenario bounds.");
     uemobility.SetMobilityModel(
-        "ns3::RandomWalk2dMobilityModel", "Mode", StringValue("Time"), "Time",
-        StringValue("2s"), "Speed",
-        StringValue("ns3::ConstantRandomVariable[Constant=20.0]"), // 20 m/s
-        "Bounds", StringValue(walkBounds)); // Bounds based on scenarioSize
+        "ns3::RandomWalk2dMobilityModel",
+        "Mode", StringValue("Time"),
+        "Time", StringValue("2s"),
+        "Speed", StringValue("ns3::ConstantRandomVariable[Constant=20.0]"),
+        "Bounds", StringValue("0|" + std::to_string(scenarioSize) + "|0|" + std::to_string(scenarioSize))
+    );
     uemobility.Install(ueNodes);
-    NS_LOG_INFO("Mobile UEs installed with RandomWalk2dMobilityModel within "
-                "scenario size bounds.");
-  }
+}
 
   // Install on PGW and RemoteHost too for NetAnim
   enbmobility.Install(
